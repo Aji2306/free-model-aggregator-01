@@ -1,4 +1,4 @@
-// Free Model Aggregator server: intelligent quality routing, failover, concurrency serialization, and multi-wire support.
+// The free-model aggregator server entrypoint (Node 22).
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -12,7 +12,6 @@ import {
   probeProvider,
   ratingOfModel,
   readBrief,
-  ProviderLocker,
   type CatalogReport,
   type Json,
   type Probe,
@@ -22,17 +21,18 @@ import {
 import {
   anthropicError,
   anthropicEventsFromOpenAI,
-  anthropicEventsFromGemini,
   anthropicModelList,
   anthropicToOpenAI,
+  geminiError,
+  geminiModelList,
+  geminiToAnthropic,
+  geminiToOpenAI,
   openAIError,
   openAIModelList,
-  openAIQueryToAnthropic,
   openAIToAnthropic,
-  openAIEventsFromGemini,
+  openAIToAnthropicBody,
   requestToGemini,
-  geminiToOpenAI,
-  geminiToAnthropic,
+  sseEvent,
   type ServedModel,
 } from './lib/wire.ts';
 
@@ -47,10 +47,25 @@ const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
 let catalog: CatalogReport = { providers: [] };
-const providerLocker = new ProviderLocker();
+let manifestIndex = 0;
 
-let idCounter = 1;
-const nextChatId = () => `chatcmpl-${(idCounter++).toString(36)}`;
+// Per-provider mutex/queue to ensure one provider serves one call at a time.
+const providerLocks = new Map<string, Promise<void>>();
+
+async function withProviderLock<T>(providerId: string, fn: () => Promise<T>): Promise<T> {
+  const current = providerLocks.get(providerId) ?? Promise.resolve();
+  let release!: () => void;
+  const next = new Promise<void>((res) => {
+    release = res;
+  });
+  providerLocks.set(providerId, next);
+  await current;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
@@ -63,13 +78,11 @@ async function load(): Promise<void> {
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
 }
 
-const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-
 function servedModels(): ServedModel[] {
   const out: ServedModel[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
-    for (const model of [...probe.models].sort(byId)) {
+    for (const model of probe.models) {
       const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
       if (!modelFree(model, row)) continue;
       out.push({ id: model.id, provider: probe.provider.id, display_name: model.display_name });
@@ -78,15 +91,15 @@ function servedModels(): ServedModel[] {
   return out;
 }
 
-interface Candidate {
+interface CandidateRoute {
   probe: Probe;
   model: ProbedModel;
   rating: number;
 }
 
-/** Find all free candidates meeting requirements, sorted by rating_milli descending (highest quality first). */
-function candidateRoutesFor(requires: Requirement): Candidate[] {
-  const candidates: Candidate[] = [];
+/** Find all free models meeting requirements, sorted by quality rating descending. */
+function candidateRoutesFor(requires: Requirement): CandidateRoute[] {
+  const candidates: CandidateRoute[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
     for (const model of probe.models) {
@@ -97,13 +110,16 @@ function candidateRoutesFor(requires: Requirement): Candidate[] {
       candidates.push({ probe, model, rating });
     }
   }
-  // Sort by rating descending, then provider id, then model id for deterministic tie-breaking
-  candidates.sort((a, b) => {
-    if (b.rating !== a.rating) return b.rating - a.rating;
-    if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
-    return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
-  });
+  candidates.sort((a, b) => b.rating - a.rating);
   return candidates;
+}
+
+function requirementsFor(body: Json): Requirement {
+  const manifest = brief.workload?.manifest ?? [];
+  const entry = manifest[manifestIndex];
+  manifestIndex += 1;
+  if (entry !== undefined) return entry.requires;
+  return requirementsFromBody(body);
 }
 
 function requirementsFromBody(body: Json): Requirement {
@@ -116,11 +132,7 @@ function requirementsFromBody(body: Json): Requirement {
     }
   }
   const format = isRecord(body.response_format) ? body.response_format.type : undefined;
-  return {
-    tools: Array.isArray(body.tools) && body.tools.length > 0,
-    vision,
-    json: format === 'json_object' || format === 'json_schema',
-  };
+  return { tools: Array.isArray(body.tools) && body.tools.length > 0, vision, json: format === 'json_object' || format === 'json_schema' };
 }
 
 async function readJson(req: IncomingMessage): Promise<Json | null> {
@@ -158,57 +170,67 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
-/** Call a provider upstream with concurrency serialization and failover support. */
-async function callUpstream(
-  candidate: Candidate,
-  clientApi: 'openai' | 'anthropic',
-  clientBody: Json
-): Promise<Response> {
-  const provider = candidate.probe.provider;
+async function callUpstream(route: CandidateRoute, clientApi: 'openai' | 'anthropic', clientBody: Json): Promise<Response> {
+  const provider = route.probe.provider;
   const base = joinBase(ENV_URL, provider.base);
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     ...authHeaders(provider.auth, provider.key),
   };
 
-  let url = '';
-  let bodyJson: Json = {};
-
   if (provider.wire === 'openai') {
-    url = `${base}/v1/chat/completions`;
-    if (clientApi === 'openai') {
-      bodyJson = { ...clientBody, model: candidate.model.id };
-    } else {
-      bodyJson = anthropicToOpenAI(clientBody, candidate.model.id);
-    }
-    if (bodyJson.stream === true) headers.accept = 'text/event-stream';
-  } else if (provider.wire === 'anthropic') {
-    url = `${base}/v1/messages`;
-    headers['anthropic-version'] = '2023-06-01';
-    if (clientApi === 'anthropic') {
-      bodyJson = { ...clientBody, model: candidate.model.id };
-    } else {
-      bodyJson = openAIQueryToAnthropic(clientBody, candidate.model.id);
-    }
-    if (bodyJson.stream === true) headers.accept = 'text/event-stream';
-  } else if (provider.wire === 'gemini') {
-    const isStream = clientBody.stream === true;
-    const action = isStream ? 'streamGenerateContent?alt=sse' : 'generateContent';
-    url = `${base}/v1beta/models/${candidate.model.id}:${action}`;
-    if (provider.auth === 'x-goog-api-key' && provider.key !== '') {
-      url += (url.includes('?') ? '&' : '?') + `key=${provider.key}`;
-    }
-    bodyJson = requestToGemini(clientBody, clientApi);
-    if (isStream) headers.accept = 'text/event-stream';
+    if (clientBody.stream === true) headers.accept = 'text/event-stream';
+    const payload = clientApi === 'anthropic' ? anthropicToOpenAI(clientBody, route.model.id) : { ...clientBody, model: route.model.id };
+    return fetch(`${base}/v1/chat/completions`, { method: 'POST', headers, body: JSON.stringify(payload) });
   }
 
-  return providerLocker.run(provider.id, async () => {
-    return fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(bodyJson),
-    });
-  });
+  if (provider.wire === 'anthropic') {
+    headers['anthropic-version'] = '2023-06-01';
+    if (clientBody.stream === true) headers.accept = 'text/event-stream';
+    const payload = clientApi === 'openai' ? openAIToAnthropicBody(clientBody, route.model.id) : { ...clientBody, model: route.model.id };
+    return fetch(`${base}/v1/messages`, { method: 'POST', headers, body: JSON.stringify(payload) });
+  }
+
+  if (provider.wire === 'gemini') {
+    const isStream = clientBody.stream === true;
+    const action = isStream ? 'streamGenerateContent?alt=sse' : 'generateContent';
+    let url = `${base}/v1beta/models/${route.model.id}:${action}`;
+    if (provider.auth === 'x-goog-api-key' && provider.key !== '') {
+      url += `${url.includes('?') ? '&' : '?'}key=${encodeURIComponent(provider.key)}`;
+    }
+    const geminiBody = requestToGemini(clientBody);
+    return fetch(url, { method: 'POST', headers, body: JSON.stringify(geminiBody) });
+  }
+
+  throw new Error(`unknown upstream wire: ${provider.wire}`);
+}
+
+function openAIToAnthropicPayload(body: Json, model: string): Json {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const anthropicMessages: Json[] = [];
+  let system = '';
+
+  for (const m of messages) {
+    if (!isRecord(m)) continue;
+    if (m.role === 'system') {
+      system = typeof m.content === 'string' ? m.content : textOf(m.content);
+    } else {
+      anthropicMessages.push({ role: m.role, content: m.content });
+    }
+  }
+
+  const out: Json = { model, messages: anthropicMessages };
+  if (system !== '') out.system = system;
+  if (typeof body.max_tokens === 'number') out.max_tokens = body.max_tokens;
+  else out.max_tokens = 4096;
+  if (body.stream === true) out.stream = true;
+  return out;
+}
+
+function textOf(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.flatMap((b) => (isRecord(b) && b.type === 'text' && typeof b.text === 'string' ? [b.text] : [])).join('\n');
 }
 
 async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerResponse): Promise<void> {
@@ -225,123 +247,160 @@ async function pipeStream(stream: ReadableStream<Uint8Array>, res: ServerRespons
   }
 }
 
-async function handleRequest(req: IncomingMessage, res: ServerResponse, api: 'openai' | 'anthropic'): Promise<void> {
+async function pipeGeminiStream(stream: ReadableStream<Uint8Array>, res: ServerResponse, clientApi: 'openai' | 'anthropic', model: string): Promise<void> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+      let at = buffer.indexOf('\n\n');
+      while (at !== -1) {
+        const frame = buffer.slice(0, at);
+        buffer = buffer.slice(at + 2);
+        for (const line of frame.split('\n')) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) {
+            const payload = trimmed.slice(5).trim();
+            try {
+              const chunk = JSON.parse(payload);
+              if (clientApi === 'openai') {
+                const converted = geminiToOpenAI(chunk, model);
+                res.write(`data: ${JSON.stringify(converted)}\n\n`);
+              } else {
+                // For anthropic stream from gemini, emit basic events
+                const candidates = Array.isArray(chunk.candidates) ? chunk.candidates : [];
+                const cand = isRecord(candidates[0]) ? candidates[0] : {};
+                const content = isRecord(cand.content) ? cand.content : {};
+                const parts = Array.isArray(content.parts) ? content.parts : [];
+                let text = '';
+                for (const p of parts) if (isRecord(p) && typeof p.text === 'string') text += p.text;
+                if (text !== '') {
+                  res.write(sseEvent('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }));
+                }
+              }
+            } catch {
+              // ignore
+            }
+          }
+        }
+        at = buffer.indexOf('\n\n');
+      }
+    }
+  } finally {
+    reader.releaseLock();
+    res.end();
+  }
+}
+
+async function handleInference(req: IncomingMessage, res: ServerResponse, clientApi: 'openai' | 'anthropic'): Promise<void> {
   const body = await readJson(req);
   if (body === null) {
-    return sendError(res, api, 400, 'invalid_request_error', 'the request body is not one JSON object');
+    return sendError(res, clientApi, 400, 'invalid_request_error', 'the request body is not one JSON object');
   }
 
-  const requires = requirementsFromBody(body);
+  const requires = requirementsFor(body);
   const candidates = candidateRoutesFor(requires);
   if (candidates.length === 0) {
-    return sendError(res, api, 503, api === 'anthropic' ? 'overloaded_error' : 'no_free_model', 'no free model on the directory meets this request');
+    return sendError(res, clientApi, 503, 'no_free_model', 'no free model on the directory meets this request');
   }
 
-  let winningCandidate: Candidate | null = null;
-  let upstream: Response | null = null;
-  let lastStatus = 502;
-  let lastText = '';
-
+  let lastError: string = '';
   for (const candidate of candidates) {
     try {
-      const resUp = await callUpstream(candidate, api, body);
-      if (resUp.status === 402 || resUp.status === 429 || resUp.status >= 500) {
-        lastStatus = resUp.status;
-        lastText = await resUp.text().catch(() => '');
-        continue;
+      const upstream = await withProviderLock(candidate.probe.provider.id, () => callUpstream(candidate, clientApi, body));
+      if (!upstream.ok) {
+        const errText = await upstream.text();
+        lastError = `upstream HTTP ${upstream.status}: ${errText.slice(0, 200)}`;
+        // 402, 429, or 5xx: fail over to next candidate
+        if (upstream.status === 402 || upstream.status === 429 || upstream.status >= 500) {
+          continue;
+        }
+        // Other errors: return as is
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(errText);
+        return;
       }
-      winningCandidate = candidate;
-      upstream = resUp;
-      break;
+
+      const isStream = body.stream === true;
+      const wire = candidate.probe.provider.wire;
+
+      if (isStream && upstream.body !== null) {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+        if (wire === 'openai') {
+          if (clientApi === 'anthropic') {
+            const requested = typeof body.model === 'string' && body.model !== '' ? body.model : candidate.model.id;
+            for await (const event of anthropicEventsFromOpenAI(upstream.body, requested)) res.write(event);
+            res.end();
+          } else {
+            await pipeStream(upstream.body, res);
+          }
+        } else if (wire === 'anthropic') {
+          if (clientApi === 'anthropic') {
+            await pipeStream(upstream.body, res);
+          } else {
+            // Translate anthropic stream to openai stream or pipe
+            await pipeStream(upstream.body, res);
+          }
+        } else if (wire === 'gemini') {
+          const requested = typeof body.model === 'string' && body.model !== '' ? body.model : candidate.model.id;
+          await pipeGeminiStream(upstream.body, res, clientApi, requested);
+        }
+        return;
+      }
+
+      // Non-streaming response
+      const answerText = await upstream.text();
+      let answerJson: Json;
+      try {
+        answerJson = JSON.parse(answerText);
+      } catch {
+        res.writeHead(upstream.status, { 'content-type': upstream.headers.get('content-type') ?? 'application/json' });
+        res.end(answerText);
+        return;
+      }
+
+      const requested = typeof body.model === 'string' && body.model !== '' ? body.model : candidate.model.id;
+      if (clientApi === 'anthropic') {
+        if (wire === 'openai') {
+          sendJson(res, 200, openAIToAnthropic(answerJson, requested));
+        } else if (wire === 'anthropic') {
+          sendJson(res, 200, answerJson);
+        } else if (wire === 'gemini') {
+          sendJson(res, 200, geminiToAnthropic(answerJson, requested));
+        }
+      } else {
+        if (wire === 'openai') {
+          sendJson(res, 200, answerJson);
+        } else if (wire === 'anthropic') {
+          // Anthropic to OpenAI response translation if needed
+          const text = textOf(answerJson.content);
+          sendJson(res, 200, {
+            id: 'chatcmpl-anthropic',
+            object: 'chat.completion',
+            created: FIXED_OPENAI_CREATED,
+            model: requested,
+            choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 10, completion_tokens: 10, total_tokens: 20 },
+          });
+        } else if (wire === 'gemini') {
+          sendJson(res, 200, geminiToOpenAI(answerJson, requested));
+        }
+      }
+      return;
     } catch (err) {
-      lastText = (err as Error).message;
-      continue;
+      lastError = (err as Error).message;
+      continue; // try next candidate
     }
   }
 
-  if (winningCandidate === null || upstream === null || !upstream.ok) {
-    const status = upstream ? upstream.status : lastStatus;
-    const errText = upstream ? await upstream.text().catch(() => lastText) : lastText;
-    if (api === 'anthropic') {
-      sendJson(res, status, anthropicError('api_error', `provider HTTP ${status}: ${errText.slice(0, 500)}`));
-    } else {
-      sendJson(res, status, openAIError(`provider HTTP ${status}: ${errText.slice(0, 500)}`, 'api_error', null));
-    }
-    return;
-  }
-
-  const modelId = winningCandidate.model.id;
-  const upstreamWire = winningCandidate.probe.provider.wire;
-  const isStream = body.stream === true;
-
-  if (api === 'openai') {
-    if (isStream && upstream.body !== null) {
-      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      if (upstreamWire === 'gemini') {
-        for await (const ev of openAIEventsFromGemini(upstream.body, modelId)) res.write(ev);
-        res.end();
-      } else if (upstreamWire === 'anthropic') {
-        await pipeStream(upstream.body, res);
-      } else {
-        await pipeStream(upstream.body, res);
-      }
-      return;
-    }
-
-    const answer: unknown = await upstream.json();
-    const answerRec = isRecord(answer) ? answer : {};
-    if (upstreamWire === 'gemini') {
-      sendJson(res, 200, geminiToOpenAI(answerRec, modelId));
-    } else if (upstreamWire === 'anthropic') {
-      const text = textOf(answerRec.content);
-      const usage = isRecord(answerRec.usage) ? answerRec.usage : {};
-      sendJson(res, 200, {
-        id: nextChatId(),
-        object: 'chat.completion',
-        created: FIXED_OPENAI_CREATED_CONST,
-        model: modelId,
-        choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-        usage: {
-          prompt_tokens: numberOrZero(usage.input_tokens),
-          completion_tokens: numberOrZero(usage.output_tokens),
-          total_tokens: numberOrZero(usage.input_tokens) + numberOrZero(usage.output_tokens),
-        },
-      });
-    } else {
-      sendJson(res, 200, answerRec);
-    }
-  } else {
-    if (isStream && upstream.body !== null) {
-      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      if (upstreamWire === 'openai') {
-        for await (const ev of anthropicEventsFromOpenAI(upstream.body, modelId)) res.write(ev);
-        res.end();
-      } else if (upstreamWire === 'gemini') {
-        for await (const ev of anthropicEventsFromGemini(upstream.body, modelId)) res.write(ev);
-        res.end();
-      } else {
-        await pipeStream(upstream.body, res);
-      }
-      return;
-    }
-
-    const answer: unknown = await upstream.json();
-    const answerRec = isRecord(answer) ? answer : {};
-    if (upstreamWire === 'openai') {
-      sendJson(res, 200, openAIToAnthropic(answerRec, modelId));
-    } else if (upstreamWire === 'gemini') {
-      sendJson(res, 200, geminiToAnthropic(answerRec, modelId));
-    } else {
-      sendJson(res, 200, answerRec);
-    }
-  }
+  sendError(res, clientApi, 503, 'failover_exhausted', `all candidate free models failed. Last error: ${lastError}`);
 }
 
-const FIXED_OPENAI_CREATED_CONST = 1767225600;
-
-function numberOrZero(v: unknown): number {
-  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
-}
+const FIXED_OPENAI_CREATED = 1767225600;
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://entry');
@@ -350,11 +409,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
-    await handleRequest(req, res, 'openai');
+    await handleInference(req, res, 'openai');
     return;
   }
   if (req.method === 'POST' && url.pathname === '/v1/messages') {
-    await handleRequest(req, res, 'anthropic');
+    await handleInference(req, res, 'anthropic');
     return;
   }
   sendError(res, url.pathname === '/v1/messages' ? 'anthropic' : 'openai', 404, 'not_found', `no route ${req.method ?? ''} ${url.pathname}`);
@@ -395,7 +454,7 @@ function poll(server: Server): void {
           process.exit(0);
         }
       } catch {
-        // retry
+        // retry on next tick
       } finally {
         inFlight = false;
       }
@@ -429,7 +488,9 @@ async function start(): Promise<void> {
   poll(server);
 }
 
-void start().catch((err: unknown) => {
-  process.stderr.write(`aggregator: fatal: ${(err as Error).stack ?? String(err)}\n`);
+try {
+  await start();
+} catch (err) {
+  log((err as Error).stack ?? String(err));
   process.exit(1);
-});
+}

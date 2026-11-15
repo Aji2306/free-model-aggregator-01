@@ -1,4 +1,4 @@
-// The brief's three documents, catalog probe, rating evaluation, and provider rate-limit/concurrency locking.
+// The brief's three documents, catalog probing across OpenAI, Anthropic, and Gemini wires, and quality routing.
 
 import { readFileSync } from 'node:fs';
 
@@ -367,24 +367,4 @@ export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings:
     providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
   }
   return { providers };
-}
-
-/** Provider concurrency serializing lock to prevent 429 concurrent_requests. */
-export class ProviderLocker {
-  #locks = new Map<string, Promise<void>>();
-
-  async run<T>(providerId: string, fn: () => Promise<T>): Promise<T> {
-    const current = this.#locks.get(providerId) ?? Promise.resolve();
-    let release: () => void = () => {};
-    const next = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    this.#locks.set(providerId, next);
-    await current;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
-  }
 }
