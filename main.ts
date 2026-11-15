@@ -35,11 +35,14 @@ import {
   sseEvent,
   type ServedModel,
 } from './lib/wire.ts';
+import { ModelRouter, summarizeDecision } from './lib/router.ts';
 
 const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
 const PROBE_TIMEOUT_MS = 5000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
+
+const router = new ModelRouter();
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -303,7 +306,11 @@ async function handleInference(req: IncomingMessage, res: ServerResponse, client
   }
 
   const requires = requirementsFor(body);
-  const candidates = candidateRoutesFor(requires);
+  const weight = (brief.workload?.manifest ?? [])[manifestIndex - 1]?.weight ?? 1;
+  const options = router.evaluateCandidates(probes, brief.ratings, requires);
+  const decision = router.planAllocation(options, weight, requires);
+  log(summarizeDecision(decision));
+  const candidates = decision.selected !== null ? [decision.selected, ...decision.fallbackChain] : [];
   if (candidates.length === 0) {
     return sendError(res, clientApi, 503, 'no_free_model', 'no free model on the directory meets this request');
   }
